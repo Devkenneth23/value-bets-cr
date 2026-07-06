@@ -95,6 +95,8 @@ model Opportunity {
   eventId          String
   type             OpportunityType
   marketKey        String
+  outcomeName      String          @default("")
+  bookmakerKey     String          @default("")
   details          Json
   expectedValue    Decimal?        @db.Decimal(10, 4)
   guaranteedProfit Decimal?        @db.Decimal(10, 4)
@@ -104,6 +106,7 @@ model Opportunity {
 
   event Event @relation(fields: [eventId], references: [id])
 
+  @@unique([eventId, marketKey, outcomeName, bookmakerKey, type])
   @@index([eventId])
   @@index([type])
   @@index([isActive])

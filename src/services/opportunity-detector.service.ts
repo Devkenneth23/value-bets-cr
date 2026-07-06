@@ -3,16 +3,20 @@ import { env } from "@/lib/env";
 import { BettingMathService, type OutcomeOdds } from "./betting-math.service";
 import type { OpportunityType, Prisma } from "@prisma/client";
 
-const MIN_EV_THRESHOLD = 0.02; // solo guardar value bets con EV mayor a 2%
-const ODDS_FRESHNESS_MINUTES = 30; // ignorar cuotas mas viejas que esto
+const MIN_EV_THRESHOLD = 0.02;
+const ODDS_FRESHNESS_MINUTES = 30;
+const MIN_PEER_BOOKMAKERS = 2;
 
 export class OpportunityDetectorService {
-  /**
-   * Corre deteccion completa sobre todos los eventos con cuotas recientes.
-   * Disenado para correr despues de cada ciclo de ingestion.
-   */
   static async detectAll(): Promise<{ arbitrageFound: number; valueBetsFound: number }> {
     const cutoff = new Date(Date.now() - ODDS_FRESHNESS_MINUTES * 60 * 1000);
+
+    await prisma.opportunity.updateMany({
+      where: {
+        event: { commenceTime: { gt: new Date() } },
+      },
+      data: { isActive: false },
+    });
 
     const events = await prisma.event.findMany({
       where: {
@@ -50,10 +54,6 @@ export class OpportunityDetectorService {
     return { arbitrageFound, valueBetsFound };
   }
 
-  /**
-   * Dado que guardamos cada fetch como fila nueva (historial), nos quedamos solo
-   * con la cuota mas reciente por combinacion bookmaker + outcome.
-   */
   private static dedupeToLatestPerBookmaker<
     T extends { bookmakerId: string; outcomeName: string; fetchedAt: Date; market: { key: string } }
   >(odds: T[]): T[] {
@@ -79,7 +79,6 @@ export class OpportunityDetectorService {
   ): Promise<boolean> {
     const outcomeNames = [...new Set(marketOdds.map((o) => o.outcomeName))];
 
-    // Arbitraje solo tiene sentido si hay mas de un resultado posible (h2h con 2-3 outcomes)
     if (outcomeNames.length < 2) return false;
 
     const bestOddsPerOutcome: OutcomeOdds[] = outcomeNames.map((outcomeName) => {
@@ -98,11 +97,28 @@ export class OpportunityDetectorService {
 
     if (!result.isArbitrage) return false;
 
-    await prisma.opportunity.create({
-      data: {
+    await prisma.opportunity.upsert({
+      where: {
+        eventId_marketKey_outcomeName_bookmakerKey_type: {
+          eventId,
+          marketKey,
+          outcomeName: "",
+          bookmakerKey: "",
+          type: "ARBITRAGE" as OpportunityType,
+        },
+      },
+      update: {
+        guaranteedProfit: result.guaranteedProfitPercentage,
+        details: result as unknown as Prisma.InputJsonValue,
+        isActive: true,
+        detectedAt: new Date(),
+      },
+      create: {
         eventId,
         type: "ARBITRAGE" as OpportunityType,
         marketKey,
+        outcomeName: "",
+        bookmakerKey: "",
         guaranteedProfit: result.guaranteedProfitPercentage,
         details: result as unknown as Prisma.InputJsonValue,
       },
@@ -121,32 +137,78 @@ export class OpportunityDetectorService {
     }>
   ): Promise<number> {
     const outcomeNames = [...new Set(marketOdds.map((o) => o.outcomeName))];
+    const bookmakerKeys = [...new Set(marketOdds.map((o) => o.bookmaker.key))];
+
+    const devigByBookmaker = new Map<string, Map<string, number>>();
+
+    for (const bk of bookmakerKeys) {
+      const allOutcomesForBookmaker = marketOdds.filter((o) => o.bookmaker.key === bk);
+      const prices = allOutcomesForBookmaker.map((o) => Number(o.price));
+      const devigProbs = BettingMathService.devigImpliedProbabilities(prices);
+
+      const outcomeMap = new Map<string, number>();
+      for (let i = 0; i < allOutcomesForBookmaker.length; i++) {
+        const odd = allOutcomesForBookmaker[i];
+        const prob = devigProbs[i];
+        if (odd !== undefined && prob !== undefined) {
+          outcomeMap.set(odd.outcomeName, prob);
+        }
+      }
+      devigByBookmaker.set(bk, outcomeMap);
+    }
+
     let found = 0;
 
     for (const outcomeName of outcomeNames) {
       const oddsForOutcome = marketOdds.filter((o) => o.outcomeName === outcomeName);
-      const allPrices = oddsForOutcome.map((o) => Number(o.price));
 
-      // Evaluar TODAS las casas disponibles contra el consenso del mercado.
-      // Antes estaba hardcodeado a bet365, pero esa casa no siempre aparece
-      // en la respuesta de The Odds API segun la region/deporte. Generalizar
-      // permite detectar value bets sin importar que casa ofrezca la cuota.
       for (const candidateOdd of oddsForOutcome) {
+        const candidateBk = candidateOdd.bookmaker.key;
+
+        const peerProbs: number[] = [];
+        for (const [bk, outcomeMap] of devigByBookmaker) {
+          if (bk === candidateBk) continue;
+          const prob = outcomeMap.get(outcomeName);
+          if (prob !== undefined) {
+            peerProbs.push(prob);
+          }
+        }
+
+        if (peerProbs.length < MIN_PEER_BOOKMAKERS) continue;
+
         const evaluation = BettingMathService.evaluateValueBet(
           outcomeName,
-          candidateOdd.bookmaker.key,
+          candidateBk,
           Number(candidateOdd.price),
-          allPrices,
+          peerProbs,
           env.KELLY_FRACTION_MULTIPLIER
         );
 
         if (evaluation.expectedValue < MIN_EV_THRESHOLD) continue;
 
-        await prisma.opportunity.create({
-          data: {
+        await prisma.opportunity.upsert({
+          where: {
+            eventId_marketKey_outcomeName_bookmakerKey_type: {
+              eventId,
+              marketKey,
+              outcomeName,
+              bookmakerKey: candidateBk,
+              type: "VALUE_BET" as OpportunityType,
+            },
+          },
+          update: {
+            expectedValue: evaluation.expectedValue,
+            kellyFraction: evaluation.kellyFractionRecommended,
+            details: evaluation as unknown as Prisma.InputJsonValue,
+            isActive: true,
+            detectedAt: new Date(),
+          },
+          create: {
             eventId,
             type: "VALUE_BET" as OpportunityType,
             marketKey,
+            outcomeName,
+            bookmakerKey: candidateBk,
             expectedValue: evaluation.expectedValue,
             kellyFraction: evaluation.kellyFractionRecommended,
             details: evaluation as unknown as Prisma.InputJsonValue,

@@ -6,7 +6,7 @@
 export interface OutcomeOdds {
   outcomeName: string;
   bookmakerKey: string;
-  price: number; // cuota decimal, ej: 2.15
+  price: number;
 }
 
 export interface ArbitrageResult {
@@ -29,12 +29,8 @@ export interface ValueBetResult {
 }
 
 export class BettingMathService {
-  private static readonly DEFAULT_KELLY_MULTIPLIER = 0.25; // Kelly 1/4, conservador
+  private static readonly DEFAULT_KELLY_MULTIPLIER = 0.25;
 
-  /**
-   * Probabilidad implicita de una cuota decimal.
-   * Cuota 2.00 implica 50% de probabilidad segun el mercado.
-   */
   static impliedProbability(decimalOdds: number): number {
     if (decimalOdds <= 1) {
       throw new Error("La cuota decimal debe ser mayor a 1.0");
@@ -43,9 +39,47 @@ export class BettingMathService {
   }
 
   /**
-   * Detecta arbitraje entre las mejores cuotas de cada resultado posible de un evento.
-   * Requiere una cuota por cada resultado mutuamente excluyente (ej: Home/Draw/Away).
+   * Remueve el vig (overround) de un bookmaker usando todos sus outcomes del mismo mercado.
+   * Divide cada probabilidad implicita entre la suma total para que sumen exactamente 1.
    */
+  static devigImpliedProbabilities(pricesForAllOutcomesOneBookmaker: number[]): number[] {
+    if (pricesForAllOutcomesOneBookmaker.length === 0) {
+      throw new Error("Se necesita al menos un outcome para de-viguear");
+    }
+
+    const rawProbs = pricesForAllOutcomesOneBookmaker.map((price) => this.impliedProbability(price));
+    const totalRaw = rawProbs.reduce((sum, p) => sum + p, 0);
+
+    return rawProbs.map((p) => p / totalRaw);
+  }
+
+  static median(values: number[]): number {
+    if (values.length === 0) {
+      throw new Error("Se necesita al menos un valor para calcular mediana");
+    }
+
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+
+    if (sorted.length % 2 === 0) {
+      const lower = sorted[mid - 1] as number;
+      const upper = sorted[mid] as number;
+      return (lower + upper) / 2;
+    }
+    return sorted[mid] as number;
+  }
+
+  /**
+   * Probabilidad de consenso a partir de probabilidades YA de-vigueadas de casas peer
+   * (excluyendo la casa que se esta evaluando). Usa mediana por robustez.
+   */
+  static consensusProbability(peerDevigProbabilities: number[]): number {
+    if (peerDevigProbabilities.length === 0) {
+      throw new Error("Se necesita al menos una probabilidad peer para calcular consenso");
+    }
+    return this.median(peerDevigProbabilities);
+  }
+
   static detectArbitrage(bestOddsPerOutcome: OutcomeOdds[]): ArbitrageResult {
     const totalImpliedProbability = bestOddsPerOutcome.reduce(
       (sum, outcome) => sum + this.impliedProbability(outcome.price),
@@ -76,53 +110,29 @@ export class BettingMathService {
     };
   }
 
-  /**
-   * Calcula el consenso de probabilidad "real" a partir del promedio de todas las
-   * casas disponibles para un resultado, normalizado para remover el overround (vig).
-   */
-  static consensusProbability(allOddsForOutcome: number[]): number {
-    if (allOddsForOutcome.length === 0) {
-      throw new Error("Se necesita al menos una cuota para calcular consenso");
-    }
-    const impliedProbs = allOddsForOutcome.map((price) => this.impliedProbability(price));
-    const average = impliedProbs.reduce((sum, p) => sum + p, 0) / impliedProbs.length;
-    return average;
+  static expectedValue(consensusProb: number, offeredPrice: number): number {
+    return consensusProb * offeredPrice - 1;
   }
 
-  /**
-   * Expected value de una apuesta de $1: (probabilidad_real * cuota) - 1.
-   * EV positivo significa que la cuota ofrecida es mayor a lo que el consenso del
-   * mercado sugiere que deberia ser — no es garantia de ganar esa apuesta puntual.
-   */
-  static expectedValue(consensusProbability: number, offeredPrice: number): number {
-    return consensusProbability * offeredPrice - 1;
-  }
-
-  /**
-   * Kelly Criterion completo: fraccion optima de banca a apostar.
-   * f* = (bp - q) / b
-   * donde b = cuota_decimal - 1, p = probabilidad de ganar, q = 1 - p
-   */
   static kellyFraction(winProbability: number, decimalOdds: number): number {
     const b = decimalOdds - 1;
     const p = winProbability;
     const q = 1 - p;
     const fraction = (b * p - q) / b;
-    return Math.max(0, fraction); // nunca negativo, Kelly negativo = no apostar
+    return Math.max(0, fraction);
   }
 
   /**
-   * Evalua una cuota especifica contra el consenso del mercado y retorna
-   * el analisis completo: EV, Kelly completo y Kelly fraccionado recomendado.
+   * Evalua una cuota contra la mediana de probabilidades de-vigueadas de casas peer.
    */
   static evaluateValueBet(
     outcomeName: string,
     bookmakerKey: string,
     offeredPrice: number,
-    allMarketOdds: number[],
+    peerDevigProbabilitiesForOutcome: number[],
     kellyMultiplier: number = this.DEFAULT_KELLY_MULTIPLIER
   ): ValueBetResult {
-    const consensusProb = this.consensusProbability(allMarketOdds);
+    const consensusProb = this.consensusProbability(peerDevigProbabilitiesForOutcome);
     const impliedProb = this.impliedProbability(offeredPrice);
     const edgePercentage = (consensusProb - impliedProb) * 100;
     const ev = this.expectedValue(consensusProb, offeredPrice);
@@ -142,9 +152,6 @@ export class BettingMathService {
     };
   }
 
-  /**
-   * Calcula el monto en dinero a apostar dado el bankroll total y la fraccion de Kelly.
-   */
   static stakeAmount(bankrollTotal: number, kellyFractionRecommended: number): number {
     return Number((bankrollTotal * kellyFractionRecommended).toFixed(2));
   }
