@@ -1,0 +1,46 @@
+# Ingestion de cuotas via GitHub Actions en vez de Vercel Cron.
+# Razon: el proceso tarda ~4 minutos (latencia a Neon + API calls secuenciales)
+# y Vercel Hobby tiene limite de 10s por funcion. GitHub Actions permite hasta 6h
+# de ejecucion por job, asi que los 4 min no son problema.
+
+name: Ingest Odds
+
+on:
+  schedule:
+    # Cada 15 minutos, alineado con la frecuencia original del cron de Vercel.
+    # Nota: GitHub Actions no garantiza ejecucion exacta al minuto — puede haber
+    # delay de 1-5 min en momentos de alta carga, pero para odds deportivas es aceptable.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    # Permite ejecucion manual desde la UI de GitHub o via `gh workflow run ingest.yml`
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      ODDS_API_BASE_URL: ${{ secrets.ODDS_API_BASE_URL }}
+      BANKROLL_TOTAL: ${{ secrets.BANKROLL_TOTAL }}
+      KELLY_FRACTION_MULTIPLIER: ${{ secrets.KELLY_FRACTION_MULTIPLIER }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Run ingestion and detection
+        run: npm run ingest

@@ -1,0 +1,136 @@
+// Schema de value-bets-cr
+// Sistema personal de analisis de cuotas: EV, Kelly Criterion, arbitraje
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Sport {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  group     String
+  title     String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events Event[]
+
+  @@index([isActive])
+  @@map("sports")
+}
+
+model Event {
+  id           String   @id @default(uuid())
+  externalId   String   @unique
+  sportId      String
+  homeTeam     String
+  awayTeam     String
+  commenceTime DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sport         Sport         @relation(fields: [sportId], references: [id])
+  odds          Odds[]
+  opportunities Opportunity[]
+
+  @@index([sportId])
+  @@index([commenceTime])
+  @@map("events")
+}
+
+model Bookmaker {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  title     String
+  createdAt DateTime @default(now())
+
+  odds Odds[]
+
+  @@map("bookmakers")
+}
+
+model Market {
+  id  String @id @default(uuid())
+  key String @unique
+
+  odds Odds[]
+
+  @@map("markets")
+}
+
+model Odds {
+  id          String   @id @default(uuid())
+  eventId     String
+  bookmakerId String
+  marketId    String
+  outcomeName String
+  price       Decimal  @db.Decimal(10, 4)
+  point       Decimal? @db.Decimal(10, 2)
+  fetchedAt   DateTime @default(now())
+
+  event     Event     @relation(fields: [eventId], references: [id])
+  bookmaker Bookmaker @relation(fields: [bookmakerId], references: [id])
+  market    Market    @relation(fields: [marketId], references: [id])
+
+  @@index([eventId])
+  @@index([bookmakerId])
+  @@index([marketId])
+  @@index([fetchedAt])
+  @@map("odds")
+}
+
+enum OpportunityType {
+  ARBITRAGE
+  VALUE_BET
+}
+
+model Opportunity {
+  id               String          @id @default(uuid())
+  eventId          String
+  type             OpportunityType
+  marketKey        String
+  details          Json
+  expectedValue    Decimal?        @db.Decimal(10, 4)
+  guaranteedProfit Decimal?        @db.Decimal(10, 4)
+  kellyFraction    Decimal?        @db.Decimal(6, 4)
+  isActive         Boolean         @default(true)
+  detectedAt       DateTime        @default(now())
+
+  event Event @relation(fields: [eventId], references: [id])
+
+  @@index([eventId])
+  @@index([type])
+  @@index([isActive])
+  @@index([detectedAt])
+  @@map("opportunities")
+}
+
+enum BetStatus {
+  PENDING
+  WON
+  LOST
+  VOID
+}
+
+model BetLog {
+  id            String    @id @default(uuid())
+  opportunityId String?
+  description   String
+  bookmakerName String
+  stake         Decimal   @db.Decimal(10, 2)
+  oddsTaken     Decimal   @db.Decimal(10, 4)
+  status        BetStatus @default(PENDING)
+  payout        Decimal?  @db.Decimal(10, 2)
+  placedAt      DateTime  @default(now())
+  settledAt     DateTime?
+
+  @@index([status])
+  @@index([placedAt])
+  @@map("bet_logs")
+}
